@@ -1,0 +1,203 @@
+import os
+import time
+import pandas as pd
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from kiteconnect import KiteConnect
+from telegram import Bot
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Kite Connect
+api_key = os.getenv("API_KEY")
+access_token = os.getenv("ACCESS_TOKEN")
+kite = KiteConnect(api_key=api_key)
+kite.set_access_token(access_token)
+
+# Initialize Telegram Bot
+telegram_bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
+telegram_chat_id = os.getenv("TELEGRAM_CHAT_ID")
+bot = Bot(token=telegram_bot_token)
+
+# Trade settings
+MAX_TRADES_PER_DAY = 10
+STOP_LOSS_PERCENT = 0.2 / 100  # 0.2% Stop-Loss
+TAKE_PROFIT_PERCENT = 0.5 / 100  # 0.5% Take-Profit
+trade_count = 0
+loss_streak = 0
+
+# Function to send Telegram alerts
+def send_telegram_message(message):
+    bot.send_message(chat_id=telegram_chat_id, text=message)
+
+# Function to fetch historical data
+def get_historical_data(symbol, interval, lookback):
+    return pd.DataFrame(kite.historical_data(
+        instrument_token=kite.instruments("NSE", symbol)[0]["instrument_token"],
+        from_date=pd.Timestamp.now() - pd.Timedelta(lookback, unit="d"),
+        to_date=pd.Timestamp.now(),
+        interval=interval,
+    ))
+
+# Function to check multi-timeframe trend
+def check_multi_timeframe_trend(symbol):
+    df_1h = get_historical_data(symbol, interval="hour", lookback=50)
+    df_5m = get_historical_data(symbol, interval="5minute", lookback=50)
+
+    ema_50_1h = df_1h["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+    ema_50_5m = df_5m["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+
+    if df_1h["close"].iloc[-1] > ema_50_1h and df_5m["close"].iloc[-1] > ema_50_5m:
+        return "Bullish"
+    elif df_1h["close"].iloc[-1] < ema_50_1h and df_5m["close"].iloc[-1] < ema_50_5m:
+        return "Bearish"
+    return "Neutral"
+
+# Function to check EMA trend
+def check_ema_trend(symbol):
+    df = get_historical_data(symbol, interval="5minute", lookback=200)
+    ema_200 = df["close"].ewm(span=200, adjust=False).mean().iloc[-1]
+    ema_50 = df["close"].ewm(span=50, adjust=False).mean().iloc[-1]
+
+    if df["close"].iloc[-1] > ema_200 and ema_50 > ema_200:
+        return "Strong Buy"
+    elif df["close"].iloc[-1] < ema_200 and ema_50 < ema_200:
+        return "Strong Sell"
+    return "Sideways - No Trade"
+
+# Function to check relative volume
+def check_relative_volume(symbol):
+    df = get_historical_data(symbol, interval="5minute", lookback=50)
+    avg_volume = df["volume"].rolling(window=20).mean().iloc[-1]
+    current_volume = df["volume"].iloc[-1]
+
+    return "High Volume Breakout" if current_volume > 1.5 * avg_volume else "Low Volume - Avoid Trade"
+
+# Function to check volatility
+def check_volatility(symbol):
+    df = get_historical_data(symbol, interval="5minute", lookback=50)
+    df["atr"] = df["high"].sub(df["low"]).rolling(window=14).mean()
+    df["+DI"] = 100 * (df["high"] - df["high"].shift(1)) / df["atr"]
+    df["-DI"] = 100 * (df["low"].shift(1) - df["low"]) / df["atr"]
+    df["dx"] = abs(df["+DI"] - df["-DI"]) / (df["+DI"] + df["-DI"]) * 100
+    df["adx"] = df["dx"].rolling(window=14).mean()
+
+    if df["atr"].iloc[-1] < 20:
+        return "Low Volatility - Avoid Trade"
+    if df["adx"].iloc[-1] < 20:
+        return "Weak Trend - Avoid Trade"
+    return "Good Volatility - Trade"
+
+# Function for dynamic position sizing
+def dynamic_position_sizing(capital, risk_per_trade=2):
+    df = get_historical_data("NSE:BANKNIFTY", interval="5minute", lookback=50)
+    atr = df["atr"].iloc[-1]
+    if atr > 50:
+        risk_per_trade = 3
+    elif atr < 20:
+        risk_per_trade = 1
+    max_risk = (risk_per_trade / 100) * capital
+    return max_risk / atr
+
+# Function to manage trade streak
+def manage_trade_streak(result):
+    global loss_streak
+    if result == "LOSS":
+        loss_streak += 1
+    else:
+        loss_streak = 0
+    if loss_streak >= 3:
+        send_telegram_message("🚨 No trades for 1 hour due to consecutive losses.")
+        time.sleep(3600)
+
+# Function to predict trade signal using machine learning
+def predict_signal(df):
+    model = RandomForestClassifier()
+    features = df[["EMA_9", "EMA_21", "RSI", "MACD", "MACD_signal", "VWAP", "Supertrend"]]
+    labels = np.where(df["close"].shift(-1) > df["close"], 1, 0)  # 1 for Buy, 0 for Sell
+    model.fit(features[:-1], labels[:-1])
+    prediction = model.predict(features[-1:])
+    return "BUY" if prediction == 1 else "SELL"
+
+# Function to execute trade
+def execute_trade(signal, symbol, position_size):
+    global trade_count
+    price = kite.ltp(symbol)[symbol]["last_price"]
+
+    stop_loss = price * (1 - STOP_LOSS_PERCENT)
+    take_profit = price * (1 + TAKE_PROFIT_PERCENT)
+
+    if signal == "BUY":
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange="NSE",
+            tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_BUY,
+            quantity=position_size,
+            order_type=kite.ORDER_TYPE_MARKET,
+            product=kite.PRODUCT_MIS,
+        )
+        send_telegram_message(f"📈 Buy Order: Entry at {price}, SL: {stop_loss}, TP: {take_profit}")
+        trade_count += 1
+        return "SUCCESS"
+    elif signal == "SELL":
+        order_id = kite.place_order(
+            variety=kite.VARIETY_REGULAR,
+            exchange="NSE",
+            tradingsymbol=symbol,
+            transaction_type=kite.TRANSACTION_TYPE_SELL,
+            quantity=position_size,
+            order_type=kite.ORDER_TYPE_MARKET,
+            product=kite.PRODUCT_MIS,
+        )
+        send_telegram_message(f"📉 Sell Order: Entry at {price}, SL: {stop_loss}, TP: {take_profit}")
+        trade_count += 1
+        return "SUCCESS"
+    return "NO TRADE"
+
+# Main trading logic
+def trading_strategy(symbol, capital):
+    global trade_count
+    if trade_count >= MAX_TRADES_PER_DAY:
+        send_telegram_message("🚨 Trade limit reached. No more trades today.")
+        return
+
+    trend = check_multi_timeframe_trend(symbol)
+    ema_trend = check_ema_trend(symbol)
+    volume_check = check_relative_volume(symbol)
+    volatility_check = check_volatility(symbol)
+
+    if "Avoid" in [volume_check, volatility_check] or ema_trend == "Sideways - No Trade":
+        return
+
+    position_size = dynamic_position_sizing(capital)
+    df = get_historical_data(symbol, interval="5minute", lookback=200)
+    signal = predict_signal(df)
+
+    if trend == "Bullish" and ema_trend == "Strong Buy" and signal == "BUY":
+        result = execute_trade("BUY", symbol, position_size)
+    elif trend == "Bearish" and ema_trend == "Strong Sell" and signal == "SELL":
+        result = execute_trade("SELL", symbol, position_size)
+    else:
+        result = "NO TRADE"
+
+    manage_trade_streak(result)
+
+# Run the bot
+def run_bot():
+    capital = 100000  # Example capital
+    symbol = "NIFTY 50"  # Replace with your trading symbol
+    while True:
+        if time.strftime("%H:%M") > "15:15":  # Stop trading before market close
+            send_telegram_message("⏳ Trading session over. No more trades.")
+            break
+
+        trading_strategy(symbol, capital)
+        time.sleep(30)  # Run every 30 seconds
+
+# Start the bot
+if __name__ == "__main__":
+    send_telegram_message("🤖 Trading bot started!")
+    run_bot()
